@@ -1,0 +1,164 @@
+{
+  "name": "kda_prefill_h8_d128_k_last",
+  "op_type": "kda",
+  "tags": [
+    "stage:prefill",
+    "model:glm-5.3-flash",
+    "status:draft"
+  ],
+  "hf_id": "zai-org/GLM-5.3-Flash",
+  "description": "KDA (Kimi Delta Attention) chunked prefill for GLM-5.3-Flash, served on 8x H200 with tensor parallel 8 (8 KDA heads per GPU). Matches vLLM's FlashKDA prefill call. Prompts are packed end to end, with boundaries given by cu_seqlens (int32). The kernel l2-normalizes q and k itself, applies sigmoid to the raw beta, and computes the gate as -5 * sigmoid(exp(A_log) * (g + dt_bias)), so every gate value is in [-5, 0], one per channel. The memory is stored as [value, key] per head, in float32. scale is 1/sqrt(128). checkpoint_offsets[n] = c (int32) means checkpoint_state[n] is prompt n's memory after its first c tokens; c is 0 (no snapshot) or a multiple of 16 smaller than the prompt's length. Rows with no snapshot must be all zeros. Constraints on the inputs: cu_seqlens starts at 0, is strictly increasing, has num_seqs + 1 entries and ends at total_seq_len.",
+  "axes": {
+    "total_seq_len": {
+      "type": "var",
+      "description": "Tokens in the whole packed batch"
+    },
+    "num_seqs": {
+      "type": "var",
+      "description": "Number of prompts"
+    },
+    "len_cu_seqlens": {
+      "type": "var",
+      "description": "Always num_seqs + 1"
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 8,
+      "description": "KDA heads per GPU: 64 / tensor parallel 8"
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Key and value size per head"
+    }
+  },
+  "constraints": [
+    "len_cu_seqlens == num_seqs + 1",
+    "total_seq_len == cu_seqlens[-1].item()",
+    "cu_seqlens[0].item() == 0",
+    "(cu_seqlens[1:] > cu_seqlens[:-1]).all()",
+    "((checkpoint_offsets == 0) | ((checkpoint_offsets % 16 == 0) & (checkpoint_offsets > 0) & (checkpoint_offsets < cu_seqlens[1:] - cu_seqlens[:-1]))).all()"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "total_seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Queries, raw; l2-normalized inside"
+    },
+    "k": {
+      "shape": [
+        "total_seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Keys, raw; l2-normalized inside"
+    },
+    "v": {
+      "shape": [
+        "total_seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Values"
+    },
+    "g": {
+      "shape": [
+        "total_seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Raw gate logits, one per key channel"
+    },
+    "beta": {
+      "shape": [
+        "total_seq_len",
+        "num_heads"
+      ],
+      "dtype": "bfloat16",
+      "description": "Raw write-strength logits; sigmoid inside"
+    },
+    "A_log": {
+      "shape": [
+        "num_heads"
+      ],
+      "dtype": "float32",
+      "description": "Layer weight: log gate scale per head"
+    },
+    "dt_bias": {
+      "shape": [
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "float32",
+      "description": "Layer weight: gate bias per head and channel"
+    },
+    "scale": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Output scale; always head_dim ** -0.5"
+    },
+    "cu_seqlens": {
+      "shape": [
+        "len_cu_seqlens"
+      ],
+      "dtype": "int32",
+      "description": "Prompt boundaries: prompt n is tokens cu_seqlens[n] to cu_seqlens[n+1]-1"
+    },
+    "initial_state": {
+      "shape": [
+        "num_seqs",
+        "num_heads",
+        "head_dim",
+        "head_dim"
+      ],
+      "dtype": "float32",
+      "description": "Starting memory, layout [value, key]"
+    },
+    "checkpoint_offsets": {
+      "shape": [
+        "num_seqs"
+      ],
+      "dtype": "int32",
+      "description": "Snapshot position per prompt, counted from its first token; 0 = none"
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "total_seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Attention output per token"
+    },
+    "final_state": {
+      "shape": [
+        "num_seqs",
+        "num_heads",
+        "head_dim",
+        "head_dim"
+      ],
+      "dtype": "float32",
+      "description": "Memory after each prompt's last token"
+    },
+    "checkpoint_state": {
+      "shape": [
+        "num_seqs",
+        "num_heads",
+        "head_dim",
+        "head_dim"
+      ],
+      "dtype": "float32",
+      "description": "Memory after the first checkpoint_offsets[n] tokens for each prompt; rows for prompts with no snapshot (offset 0) are all zeros."
+    }
+  },
+  "reference": "\"\"\"Reference for kda_prefill_h8_d128_k_last: KDA prefill, one token at a time.\"\"\"\n\n# What this computes: vLLM's FlashKDA prefill call for GLM-5.3-Flash\n# (`_flashkda_prefill`: raw g and beta, q/k l2-normalized in-kernel, bounded gate):\n#   https://github.com/vllm-project/vllm/blob/ae7048c068d0382fc476d3afa64f6f1c63b38662/vllm/models/glm5next/common/kda.py#L409-L476\n# The same recurrence in pure PyTorch, which this file is cross-checked against\n# (`naive_recurrent_kda`, with `naive_kda_lowerbound_gate` from ../gate.py):\n#   https://github.com/fla-org/flash-linear-attention/blob/7edb579d636139df2b31df580d497928121d35d4/fla/ops/kda/naive.py#L12-L66\n\nimport torch\n\n# Gate lower bound: GLM-5.3-Flash config.json, linear_attn_config.gate_lower_bound.\nLOWER_BOUND = -5.0\n\n# l2norm epsilon, added to the sum of squares inside the square root:\n#   vLLM  vllm/third_party/flash_linear_attention/ops/l2norm.py\n#         L140 `eps: float = 1e-6`, L105 `rsqrt = tl.rsqrt(square_sum + eps)`\n#   FlashKDA (vllm-project fork)  csrc/smxx/fwd_kernel1.cuh\n#         L289 `rsqrtf(q_sq + 1e-6f)`, L290 `rsqrtf(k_sq + 1e-6f)`\nL2NORM_EPS = 1e-6\n\n\ndef l2norm(x):\n    return x / torch.sqrt((x * x).sum() + L2NORM_EPS)\n\n\ndef run(q, k, v, g, beta, A_log, dt_bias, scale, cu_seqlens, initial_state, checkpoint_offsets):\n    total_seq_len, num_heads, head_dim = q.shape\n    num_seqs = initial_state.shape[0]\n    bounds = cu_seqlens.tolist()\n    offsets = checkpoint_offsets.tolist()\n\n    output = torch.zeros(total_seq_len, num_heads, head_dim, dtype=torch.float32, device=q.device)\n    final_state = torch.zeros_like(initial_state)\n    checkpoint_state = torch.zeros_like(initial_state)  # rows with offset 0 stay zero\n\n    for n in range(num_seqs):\n        for h in range(num_heads):\n            # The memory starts over for every prompt and head: S is [V, K], fp32.\n            S = initial_state[n, h].clone()\n\n            for t in range(bounds[n], bounds[n + 1]):\n                p = t - bounds[n] + 1  # 1-based position inside this prompt\n\n                # Step 1: normalize q and k.\n                q_t = l2norm(q[t, h].float())\n                k_t = l2norm(k[t, h].float())\n                v_t = v[t, h].float()\n\n                # Step 2: write strength.\n                b = torch.sigmoid(beta[t, h].float())\n\n                # Step 3: log-decay, one value per key channel, in [-5, 0].\n                a = LOWER_BOUND * torch.sigmoid(torch.exp(A_log[h]) * (g[t, h].float() + dt_bias[h]))\n\n                # Step 4: decay the memory along the key dimension.\n                S = S * torch.exp(a)[None, :]\n\n                # Step 5: delta-rule update.\n                S = S + b * torch.outer(v_t - S @ k_t, k_t)\n\n                # Step 6: read out.\n                output[t, h] = S @ (scale * q_t)\n\n                # Step 7: snapshot after exactly `offsets[n]` tokens of this prompt.\n                if offsets[n] == p:\n                    checkpoint_state[n, h] = S\n\n            final_state[n, h] = S\n\n    return output.to(torch.bfloat16), final_state, checkpoint_state\n"
+}
